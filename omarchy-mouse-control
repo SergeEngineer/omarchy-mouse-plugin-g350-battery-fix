@@ -11,6 +11,165 @@ import glob
 import re
 import subprocess
 
+import time
+import shutil
+
+# ---------------------------------------------------------------------------
+# Battery fallback chain for omarchy-mouse-control
+#   1. kernel sysfs (hidpp_battery*)   - original behaviour, plus level-only support
+#   2. UPower                          - same kernel data, different path
+#   3. Solaar CLI (`solaar show`)      - talks HID++ directly; reads the G305
+# Paste this block ABOVE `def get_state():` (it needs `import time, shutil`).
+# ---------------------------------------------------------------------------
+BATTERY_CACHE = os.path.expanduser("~/.cache/omarchy-mouse-battery.json")
+BATTERY_TTL = 60  # seconds; `solaar show` is slow, so don't run it on every poll
+LEVELS = {"critical": 5, "low": 20, "normal": 60, "good": 60, "high": 80, "full": 100}
+
+
+def _read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except Exception:
+        return None
+
+
+def battery_from_sysfs():
+    for p in sorted(glob.glob("/sys/class/power_supply/hidpp_battery*")):
+        cap = _read(p + "/capacity")
+        level = (_read(p + "/capacity_level") or "").lower()
+        pct = int(cap) if cap and cap.isdigit() else None
+        # Some HID++ devices only report a coarse level; the kernel then shows 0
+        if pct == 0 and level not in ("", "critical", "unknown"):
+            pct = None
+        approx = False
+        if pct is None and level in LEVELS:
+            pct, approx = LEVELS[level], True
+        if pct is not None:
+            return {"pct": pct, "approx": approx, "level": level.capitalize(),
+                    "status": _read(p + "/status") or "Unknown",
+                    "name": _read(p + "/model_name")}
+    return None
+
+
+def battery_from_upower():
+    if not shutil.which("upower"):
+        return None
+    try:
+        paths = subprocess.check_output(["upower", "-e"], timeout=2, text=True).splitlines()
+        for path in paths:
+            if not re.search(r"mouse|hidpp", path, re.I):
+                continue
+            info = subprocess.check_output(["upower", "-i", path], timeout=2, text=True)
+            m = re.search(r"percentage:\s*(\d+)%", info)
+            if m:
+                st = re.search(r"state:\s*(\S+)", info)
+                nm = re.search(r"model:\s*(.+)", info)
+                lv = re.search(r"battery-level:\s*(\w+)", info)
+                coarse = bool(lv and lv.group(1).lower() != "none")
+                return {"approx": coarse, "level": lv.group(1).capitalize() if coarse else "",
+                        "pct": int(m.group(1)),
+                        "status": st.group(1).capitalize() if st else "Unknown",
+                        "name": nm.group(1).strip() if nm else None}
+    except Exception:
+        pass
+    return None
+
+
+def parse_solaar_show(out, prefer=""):
+    """Parse `solaar show` output into a battery dict for the best-matching device."""
+    devices, cur = [], None
+    for line in out.splitlines():
+        m = re.match(r"^ {1,5}\d+:\s+(\S.*?)\s*$", line)     # "  1: G305 Lightspeed ..." (not "     5: BATTERY STATUS")
+        if m:
+            cur = {"name": m.group(1), "pct": None, "status": "Unknown", "approx": False}
+            devices.append(cur)
+            continue
+        if cur is None or "Battery" not in line:
+            continue
+        b = re.search(r"Battery:\s*(\d+)%", line)
+        if b:
+            cur["pct"] = int(b.group(1))
+            st = re.search(r"BatteryStatus\.(\w+)", line) or re.search(r",\s*([A-Za-z]+)", line)
+            if st:
+                cur["status"] = st.group(1).replace("_", " ").capitalize()
+        else:                                                  # level-only, e.g. "Good (high)"
+            low = line.lower()
+            for word, val in LEVELS.items():
+                if word in low:
+                    cur["pct"], cur["approx"], cur["level"] = val, True, word.capitalize()
+                    break
+    with_batt = [d for d in devices if d["pct"] is not None]
+    if not with_batt:
+        return None
+    tokens = [t.lower() for t in re.findall(r"[A-Za-z]*\d+[A-Za-z0-9]*", prefer or "")] + ["g305"]
+    for d in with_batt:
+        if any(t in d["name"].lower() for t in tokens):
+            return d
+    for d in with_batt:
+        if "mouse" in d["name"].lower():
+            return d
+    return with_batt[0]
+
+
+def battery_from_solaar(prefer=""):
+    if not shutil.which("solaar"):
+        return None
+    # serve from cache while fresh
+    try:
+        with open(BATTERY_CACHE) as f:
+            c = json.load(f)
+        if time.time() - c.get("ts", 0) < BATTERY_TTL:
+            return c.get("data")
+    except Exception:
+        pass
+    result = None
+    try:
+        out = subprocess.check_output(["solaar", "show"], timeout=8, text=True,
+                                      stderr=subprocess.DEVNULL)
+        result = parse_solaar_show(out, prefer)
+    except Exception:
+        pass
+    if result is None:                       # keep last known value if mouse is asleep/offline
+        try:
+            with open(BATTERY_CACHE) as f:
+                return json.load(f).get("data")
+        except Exception:
+            return None
+    try:
+        os.makedirs(os.path.dirname(BATTERY_CACHE), exist_ok=True)
+        with open(BATTERY_CACHE, "w") as f:
+            json.dump({"ts": time.time(), "data": result}, f)
+    except Exception:
+        pass
+    return result
+
+
+def read_battery(data, dev_name=None):
+    """Use the first EXACT percentage from any layer; fall back to an approximate
+    level (kernel/UPower/Solaar 'Normal', 'Low', ...) only if none is exact."""
+    approx_hit = None
+    for fn in (battery_from_sysfs, battery_from_upower,
+               lambda: battery_from_solaar(dev_name or "")):
+        r = fn()
+        if not r or r.get("pct") is None:
+            continue
+        if r.get("approx"):
+            approx_hit = approx_hit or r
+            continue
+        approx_hit = r
+        break
+    if approx_hit:
+        r = approx_hit
+        data["battery"] = r["pct"]
+        data["battery_status"] = r.get("status", "Unknown")
+        data["battery_approx"] = bool(r.get("approx"))
+        data["battery_level"] = r.get("level", "")
+        data["connected"] = True
+        if r.get("name") and data["name"] == "Logitech Mouse":
+            data["name"] = r["name"]
+# end of update section -------------------------------------------------------------------------
+#
 CONFIG_FILE = os.path.expanduser("~/.config/omarchy/mouse-lighting.json")
 STATE_DIR = os.path.expanduser("~/.local/state/omarchy")
 COLORS_FILE = os.path.join(STATE_DIR, "current/theme/colors.toml")
@@ -216,25 +375,6 @@ def get_state():
         }
     }
 
-    # 1. Battery from sysfs
-    for p in glob.glob("/sys/class/power_supply/hidpp_battery*"):
-        try:
-            if os.path.exists(os.path.join(p, "capacity")):
-                with open(os.path.join(p, "capacity")) as f:
-                    data["battery"] = int(f.read().strip())
-            if os.path.exists(os.path.join(p, "status")):
-                with open(os.path.join(p, "status")) as f:
-                    data["battery_status"] = f.read().strip()
-            if os.path.exists(os.path.join(p, "model_name")):
-                with open(os.path.join(p, "model_name")) as f:
-                    name = f.read().strip()
-                    if name:
-                        data["name"] = name
-            data["connected"] = True
-            break
-        except Exception:
-            pass
-
     # 2. Hyprland sensitivity
     try:
         out = subprocess.check_output(["hyprctl", "getoption", "input:sensitivity", "-j"], timeout=1)
@@ -269,6 +409,10 @@ def get_state():
                 data["rates"] = rates_parsed
         except Exception:
             pass
+
+    # Battery (sysfs -> UPower -> Solaar), after ratbag so dev_name is known
+    if data["battery"] < 0:
+        read_battery(data, dev_name)
 
     # 4. Lighting state
     cfg = load_lighting_config()
