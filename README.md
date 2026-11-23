@@ -165,7 +165,7 @@ If you need to switch forks or the update fails, remove and add it again:
 
 ```bash
 omarchy plugin remove optimistprime.mouse --yes
-omarchy plugin add https://github.com/<your-username>/omarchy-mouse-plugin.git --enable
+omarchy plugin add https://github.com/SergeEngineer/omarchy-mouse-plugin-g350-battery-fix --enable
 omarchy restart shell
 ```
 
