@@ -22,6 +22,12 @@ Panel {
   property real hyprSensitivity: 0.35
   property bool showPercentage: false
 
+  // DPI write feedback. The backend verifies each write by reading it back,
+  // so this stays true until the mouse has actually accepted the value.
+  property bool dpiWritePending: false
+  property int queuedDpi: 0
+  property string controlError: ""
+
   // Lighting properties
   property bool lightingEnabled: true
   property string lightingMode: "color"
@@ -92,8 +98,19 @@ Panel {
 
   function setDpi(dpi) {
     var val = Math.round(Number(dpi))
+    if (!isFinite(val) || val <= 0) return
     root.activeDpi = val
-    Quickshell.execDetached([root.mouseControlBin, "set-dpi", String(val)])
+    root.controlError = ""
+
+    // Serialise writes: the backend reads the value back before succeeding.
+    if (dpiWriteProc.running) {
+      root.queuedDpi = val
+      root.dpiWritePending = true
+      return
+    }
+    root.dpiWritePending = true
+    dpiWriteProc.command = [root.mouseControlBin, "set-dpi", String(val)]
+    dpiWriteProc.running = true
   }
 
   function setRate(rate) {
@@ -142,6 +159,43 @@ Panel {
     Quickshell.execDetached([root.mouseControlBin, "set-lighting-brightness", String(Math.round(bgt))])
   }
 
+  // Dedicated DPI writer. Unlike execDetached, this surfaces failures so a
+  // sleeping mouse cannot silently leave the UI showing an unwritten DPI.
+  Process {
+    id: dpiWriteProc
+    running: false
+    command: []
+
+    stdout: StdioCollector { waitForEnd: true }
+
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var msg = String(text || "").trim()
+        if (msg) root.controlError = msg.split("\n").slice(-1)[0]
+      }
+    }
+
+    onExited: function(exitCode) {
+      root.dpiWritePending = false
+      if (exitCode !== 0 && !root.controlError) {
+        root.controlError = "Could not set DPI - move the mouse and try again"
+      }
+      if (root.queuedDpi > 0) queuedDpiTimer.start()
+    }
+  }
+
+  Timer {
+    id: queuedDpiTimer
+    interval: 0
+    repeat: false
+    onTriggered: {
+      var next = root.queuedDpi
+      root.queuedDpi = 0
+      if (next > 0) root.setDpi(next)
+    }
+  }
+
   Process {
     id: refreshProc
     command: [root.mouseControlBin, "state"]
@@ -154,8 +208,12 @@ Panel {
           if (data.name) root.deviceName = data.name
           if (data.battery !== undefined) root.battery = data.battery
           if (data.battery_status) root.batteryStatus = data.battery_status
-          if (data.active_dpi && !dpiSlider.dragging) root.activeDpi = data.active_dpi
-          if (data.active_rate) root.activeRate = data.active_rate
+          // The backend reports 0 when the device could not be read. Keep the
+          // last known value instead of falling back to a fake "1000 DPI".
+          if (data.active_dpi > 0 && !dpiSlider.dragging && !root.dpiWritePending) {
+            root.activeDpi = data.active_dpi
+          }
+          if (data.active_rate > 0) root.activeRate = data.active_rate
           if (Array.isArray(data.dpis) && data.dpis.length > 0) root.dpis = data.dpis
           if (Array.isArray(data.rates) && data.rates.length > 0) root.rates = data.rates
           if (data.hypr_sensitivity !== undefined && !sensSlider.dragging) {
@@ -701,6 +759,16 @@ Panel {
               accent: Color.accent
               fontFamily: root.fontFamily
               onChanged: function(val) { root.setDpi(val) }
+            }
+
+            Text {
+              visible: root.controlError !== ""
+              text: root.controlError
+              color: "#ff5555"
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.Wrap
+              width: parent.width
             }
           }
 

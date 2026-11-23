@@ -15,6 +15,7 @@ A native, interactive **Omarchy shell** bar widget and control engine for Logite
 - [Features](#-features)
 - [Prerequisites](#-prerequisites)
 - [Installation](#-installation)
+- [Reinstallation & updates](#reinstallation--updates)
 - [Uninstallation](#-uninstallation)
 - [Troubleshooting](#-troubleshooting)
 - [Command line interface](#-command-line-interface-omarchy-mouse-control)
@@ -140,6 +141,74 @@ Alternatively, add it by hand to `~/.config/omarchy/shell.json`, under `bar.layo
 ```bash
 omarchy plugin list                       # optimistprime.mouse should be listed and enabled
 omarchy-mouse-control state               # prints JSON with name, DPI, battery, ...
+```
+
+---
+
+## Reinstallation & updates
+
+Use this after pulling a newer version of the plugin (for example the G305
+battery and DPI reliability fixes), after installing `solaar`, or whenever the
+widget appears to be running an old copy of the control script.
+
+Reinstalling is safe: DPI, polling rate, and lighting are stored on the mouse,
+and the saved lighting settings and battery cache are left in place.
+
+### Git-managed installs (`omarchy plugin add <url>`)
+
+```bash
+omarchy plugin update optimistprime.mouse --yes
+omarchy restart shell
+```
+
+If you need to switch forks or the update fails, remove and add it again:
+
+```bash
+omarchy plugin remove optimistprime.mouse --yes
+omarchy plugin add https://github.com/<your-username>/omarchy-mouse-plugin.git --enable
+omarchy restart shell
+```
+
+### Local installs (`./install.sh`)
+
+`omarchy plugin update` does not apply to these — re-run the installer from
+your clone. It overwrites `~/.local/bin/omarchy-mouse-control` and the files in
+`~/.config/omarchy/plugins/optimistprime.mouse/` in place:
+
+```bash
+cd ~/path/to/omarchy-mouse-plugin
+git pull
+chmod +x install.sh
+./install.sh
+omarchy plugin enable optimistprime.mouse right   # only if not already enabled
+omarchy restart shell
+```
+
+For this fork specifically:
+
+```bash
+cd ~/Documents/git/omarchy-mouse-plugin-g350-battery-fix
+git pull
+./install.sh
+omarchy restart shell
+```
+
+### Confirm the reinstall took effect
+
+```bash
+omarchy plugin list | grep optimistprime.mouse
+omarchy-mouse-control state               # should show active_dpi, dpi_available, connected
+command -v omarchy-mouse-control          # should be ~/.local/bin/omarchy-mouse-control
+```
+
+If the widget still behaves like an older version, compare the installed
+scripts with the ones in your clone:
+
+```bash
+diff -u ~/path/to/omarchy-mouse-plugin/omarchy-mouse-control \
+        ~/.local/bin/omarchy-mouse-control
+diff -u ~/path/to/omarchy-mouse-plugin/Panel.qml \
+        ~/.config/omarchy/plugins/optimistprime.mouse/Panel.qml
 ```
 
 ---

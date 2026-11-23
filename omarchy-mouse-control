@@ -15,6 +15,16 @@ import time
 import shutil
 
 # ---------------------------------------------------------------------------
+# ratbagctl reliability for wireless mice (G305 and friends)
+#   A sleeping receiver can stall a D-Bus call for a second or two. Short
+#   one-shot timeouts used to make the plugin report the hardcoded default
+#   DPI (1000) as if it were the real device value. Retry and use a slightly
+#   more generous timeout, but keep the UI responsive.
+# ---------------------------------------------------------------------------
+RATBAG_TIMEOUT = 3.0
+RATBAG_RETRIES = 2
+
+# ---------------------------------------------------------------------------
 # Battery fallback chain for omarchy-mouse-control
 #   1. kernel sysfs (hidpp_battery*)   - original behaviour, plus level-only support
 #   2. UPower                          - same kernel data, different path
@@ -165,7 +175,9 @@ def read_battery(data, dev_name=None):
         data["battery_status"] = r.get("status", "Unknown")
         data["battery_approx"] = bool(r.get("approx"))
         data["battery_level"] = r.get("level", "")
-        data["connected"] = True
+        # Battery data can come from a cached Solaar reading while the mouse is
+        # asleep. It must NOT be treated as proof that ratbagd can control it.
+        data["battery_available"] = True
         if r.get("name") and data["name"] == "Logitech Mouse":
             data["name"] = r["name"]
 # end of update section -------------------------------------------------------------------------
@@ -248,24 +260,62 @@ def get_theme_palette():
         palette = list(DEFAULT_PALETTE)
     return palette
 
+def ratbagctl(*args, retries=RATBAG_RETRIES):
+    """Run a ratbagctl command, retrying transient sleep/wake timeouts.
+
+    Returns stdout on success, or None on failure. Never raises.
+    """
+    for attempt in range(retries):
+        try:
+            return subprocess.check_output(
+                ["ratbagctl", *args], timeout=RATBAG_TIMEOUT, text=True,
+                stderr=subprocess.DEVNULL)
+        except Exception:
+            if attempt + 1 < retries:
+                time.sleep(0.15)
+    return None
+
+
 def find_ratbag_device():
-    try:
-        out = subprocess.check_output(["ratbagctl", "list"], timeout=1.5, text=True)
-        for line in out.strip().splitlines():
-            if ":" in line:
-                dev_id, dev_name = line.split(":", 1)
-                return dev_id.strip(), dev_name.strip()
-    except Exception:
-        pass
-    return None, None
+    """Return (dev_id, dev_name), preferring a mouse over other ratbag devices."""
+    out = ratbagctl("list")
+    if not out:
+        return None, None
+
+    candidates = []
+    for line in out.strip().splitlines():
+        if ":" not in line:
+            continue
+        dev_id, dev_name = line.split(":", 1)
+        dev_id, dev_name = dev_id.strip(), dev_name.strip()
+        if dev_id:
+            candidates.append((dev_id, dev_name))
+
+    if not candidates:
+        return None, None
+
+    # If more than one libratbag device is present (keyboard + mouse, for
+    # example), do not blindly control the first one in the list.
+    mouse_words = re.compile(r"mouse|logitech|g\s?pro|g\s?\d{3}", re.I)
+    for dev_id, dev_name in candidates:
+        if mouse_words.search(dev_name):
+            return dev_id, dev_name
+    return candidates[0]
+
+
+def ratbagctl_int(*args):
+    """Read a single integer from a ratbagctl command, or None if unavailable."""
+    out = ratbagctl(*args)
+    if out is None:
+        return None
+    m = re.search(r"\d+", out)
+    return int(m.group(0)) if m else None
+
 
 def ensure_profile_0(dev_id):
-    try:
-        p = subprocess.check_output(["ratbagctl", dev_id, "profile", "active", "get"], timeout=1.0, text=True).strip()
-        if p != "0":
-            subprocess.call(["ratbagctl", dev_id, "profile", "active", "set", "0"], timeout=1.5)
-    except Exception:
-        pass
+    p = ratbagctl(dev_id, "profile", "active", "get", retries=1)
+    if p is not None and p.strip() != "0":
+        ratbagctl(dev_id, "profile", "active", "set", "0", retries=1)
 
 def apply_lighting():
     cfg = load_lighting_config()
@@ -355,12 +405,17 @@ def sync_theme():
 def get_state():
     data = {
         "connected": False,
+        "battery_available": False,
         "name": "Logitech Mouse",
         "battery": -1,
         "battery_status": "Unknown",
-        "active_dpi": 1000,
+        # 0 means "could not read the device", never a real DPI/rate value.
+        # The UI keeps its last known value when it sees 0.
+        "active_dpi": 0,
+        "dpi_available": False,
         "dpis": [400, 800, 1000, 1200, 1600, 3200],
-        "active_rate": 1000,
+        "active_rate": 0,
+        "rate_available": False,
         "rates": [125, 250, 500, 1000],
         "hypr_sensitivity": 0.0,
         "lighting": {
@@ -383,32 +438,30 @@ def get_state():
     except Exception:
         pass
 
-    # 3. Ratbagctl device info
+    # 3. Ratbagctl device info. `connected` reflects actual ratbagd control,
+    #    not merely the presence of battery data.
     dev_id, dev_name = find_ratbag_device()
     if dev_id:
         if dev_name:
             data["name"] = dev_name
         data["connected"] = True
         ensure_profile_0(dev_id)
-        try:
-            dpi_out = subprocess.check_output(["ratbagctl", dev_id, "profile", "0", "dpi", "get"], timeout=1.5, text=True)
-            data["active_dpi"] = int(dpi_out.strip().replace("dpi", ""))
-        except Exception:
-            pass
 
-        try:
-            rate_out = subprocess.check_output(["ratbagctl", dev_id, "profile", "0", "rate", "get"], timeout=1.5, text=True)
-            data["active_rate"] = int(rate_out.strip().replace("Hz", ""))
-        except Exception:
-            pass
+        dpi = ratbagctl_int(dev_id, "profile", "0", "dpi", "get")
+        if dpi is not None:
+            data["active_dpi"] = dpi
+            data["dpi_available"] = True
 
-        try:
-            rates_all = subprocess.check_output(["ratbagctl", dev_id, "profile", "0", "rate", "get-all"], timeout=1.5, text=True)
-            rates_parsed = [int(r) for r in rates_all.strip().split() if r.isdigit()]
+        rate = ratbagctl_int(dev_id, "profile", "0", "rate", "get")
+        if rate is not None:
+            data["active_rate"] = rate
+            data["rate_available"] = True
+
+        rates_all = ratbagctl(dev_id, "profile", "0", "rate", "get-all", retries=1)
+        if rates_all:
+            rates_parsed = [int(r) for r in rates_all.split() if r.isdigit()]
             if rates_parsed:
                 data["rates"] = rates_parsed
-        except Exception:
-            pass
 
     # Battery (sysfs -> UPower -> Solaar), after ratbag so dev_name is known
     if data["battery"] < 0:
@@ -421,29 +474,72 @@ def get_state():
 
     return data
 
+def _write_ratbag_value(dev_id, field, value):
+    """Write a hardware setting and verify it by reading it back.
+
+    ratbagctl can exit 0 while a sleeping wireless mouse has silently ignored
+    the write. A failed readback is retried once; the caller is told about it
+    instead of the UI optimistically showing a value the mouse never accepted.
+    """
+    cmd = ["ratbagctl", dev_id, "profile", "0", field, "set", str(value)]
+    read_cmd = (dev_id, "profile", "0", field, "get")
+
+    def write_once():
+        try:
+            subprocess.check_call(cmd, timeout=RATBAG_TIMEOUT,
+                                  stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL)
+            return True
+        except Exception:
+            return False
+
+    if not write_once():
+        return False
+    if ratbagctl_int(*read_cmd) == value:
+        return True
+
+    # Wake-on-write: give the receiver a moment, then try once more.
+    time.sleep(0.3)
+    if not write_once():
+        return False
+    return ratbagctl_int(*read_cmd) == value
+
+
 def set_dpi(dpi_val):
+    try:
+        val = int(float(dpi_val))
+    except (TypeError, ValueError):
+        print("Error: DPI must be a number", file=sys.stderr)
+        return False
+    if val <= 0:
+        return False
     dev_id, _ = find_ratbag_device()
     if not dev_id:
+        print("Error: ratbagd cannot see a mouse (is it awake?)", file=sys.stderr)
         return False
     ensure_profile_0(dev_id)
-    try:
-        subprocess.check_call(["ratbagctl", dev_id, "profile", "0", "dpi", "set", str(dpi_val)], timeout=2)
-        return True
-    except Exception as e:
-        print(f"Error setting DPI: {e}", file=sys.stderr)
+    if not _write_ratbag_value(dev_id, "dpi", val):
+        print(f"Error: mouse did not accept DPI {val} (is it awake?)", file=sys.stderr)
         return False
+    return True
 
 def set_rate(rate_val):
+    try:
+        val = int(float(rate_val))
+    except (TypeError, ValueError):
+        print("Error: rate must be a number", file=sys.stderr)
+        return False
+    if val <= 0:
+        return False
     dev_id, _ = find_ratbag_device()
     if not dev_id:
+        print("Error: ratbagd cannot see a mouse (is it awake?)", file=sys.stderr)
         return False
     ensure_profile_0(dev_id)
-    try:
-        subprocess.check_call(["ratbagctl", dev_id, "profile", "0", "rate", "set", str(rate_val)], timeout=2)
-        return True
-    except Exception as e:
-        print(f"Error setting rate: {e}", file=sys.stderr)
+    if not _write_ratbag_value(dev_id, "rate", val):
+        print(f"Error: mouse did not accept report rate {val} Hz", file=sys.stderr)
         return False
+    return True
 
 def set_sensitivity(sens_val):
     try:
